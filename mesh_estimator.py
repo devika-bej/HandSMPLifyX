@@ -1,0 +1,229 @@
+import cv2
+import os
+import json
+import torch
+import smplx
+import trimesh
+import numpy as np
+from glob import glob
+from torchvision.transforms import Normalize
+from detectron2.config import LazyConfig
+from core.utils.utils_detectron2 import DefaultPredictor_Lazy
+from core.utils.train_utils import denormalize_images
+from core.utils.geometry import batch_rot2aa
+
+from core.datasets.dataset import Dataset
+from core.densekp_trainer import DenseKP
+from core.utils.renderer_pyrd import Renderer
+from core.utils import recursive_to
+from core.utils.geometry import batch_rot2aa
+from core.cam_model.fl_net import FLNet
+from core.constants import IMAGE_SIZE, IMAGE_MEAN, IMAGE_STD, NUM_BETAS
+
+def resize_image(img, target_size):
+    height, width = img.shape[:2]
+    aspect_ratio = width / height
+
+    # Calculate the new size while maintaining the aspect ratio
+    if aspect_ratio > 1:
+        new_width = target_size
+        new_height = int(target_size / aspect_ratio)
+    else:
+        new_width = int(target_size * aspect_ratio)
+        new_height = target_size
+
+    # Resize the image using OpenCV
+    resized_img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+    # Create a new blank image with the target size
+    final_img = np.ones((target_size, target_size, 3), dtype=np.uint8) * 255
+
+    # Paste the resized image onto the blank image, centering it
+    start_x = (target_size - new_width) // 2
+    start_y = (target_size - new_height) // 2
+    final_img[start_y:start_y + new_height, start_x:start_x + new_width] = resized_img
+
+    return aspect_ratio, final_img
+
+class HumanMeshEstimator:
+    def __init__(self, model_type='smpl', threshold=0.25):
+        self.device = (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        self.model_type = model_type
+        self.model = self.init_model()
+        self.detector = self.init_detector(threshold)
+        self.cam_model = self.init_cam_model()
+        # self.densekp_model = self.init_densekp_model()
+
+        if self.model_type == 'smpl':
+            from core.constants import SMPL_MODEL_PATH
+            self.body_model = smplx.SMPLLayer(model_path=SMPL_MODEL_PATH, num_betas=NUM_BETAS).to(self.device)
+        elif self.model_type == 'smplx':
+            from core.constants import SMPLX_MODEL_DIR, NUM_BETAS_SMPLX # In the original file, it is SMPL_MODEL_PATH
+            self.body_model = smplx.SMPLXLayer(model_path=SMPLX_MODEL_DIR, num_betas=NUM_BETAS_SMPLX).to(self.device)
+        else:
+            raise ValueError("model_type must be 'smpl' or 'smplx'")
+
+        self.normalize_img = Normalize(mean=IMAGE_MEAN, std=IMAGE_STD)
+
+    def init_cam_model(self):
+        from core.constants import CAM_MODEL_CKPT
+        model = FLNet()
+        checkpoint = torch.load(CAM_MODEL_CKPT)['state_dict']
+        model.load_state_dict(checkpoint)
+        model.eval()
+        return model
+
+    def init_model(self):
+        from core.camerahmr_model import CameraHMR
+        if self.model_type == 'smpl':
+            from core.constants import CHECKPOINT_PATH
+            checkpoint_path = CHECKPOINT_PATH
+        elif self.model_type == 'smplx':
+            from core.constants import CHECKPOINT_PATH_SMPLX
+            checkpoint_path = CHECKPOINT_PATH_SMPLX
+        else:
+            raise ValueError("model_type must be 'smpl' or 'smplx'")
+        model = CameraHMR.load_from_checkpoint(checkpoint_path, strict=False, model_type=self.model_type)
+        model = model.to(self.device)
+        model.eval()
+        return model
+    
+    def init_detector(self, threshold):
+        from core.constants import DETECTRON_CFG, DETECTRON_CKPT
+        detectron2_cfg = LazyConfig.load(str(DETECTRON_CFG))
+        detectron2_cfg.train.init_checkpoint = DETECTRON_CKPT
+        for i in range(3):
+            detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = threshold
+        detector = DefaultPredictor_Lazy(detectron2_cfg)
+        return detector
+    
+    def init_densekp_model(self):
+        from core.constants import DENSEKP_CKPT
+        model = DenseKP.load_from_checkpoint(DENSEKP_CKPT, strict=False).to(self.device).eval()
+        return model
+
+    
+    def convert_to_full_img_cam(self, pare_cam, bbox_height, bbox_center, img_w, img_h, focal_length):
+        s, tx, ty = pare_cam[:, 0], pare_cam[:, 1], pare_cam[:, 2]
+        tz = 2. * focal_length / (bbox_height * s)
+        cx = 2. * (bbox_center[:, 0] - (img_w / 2.)) / (s * bbox_height)
+        cy = 2. * (bbox_center[:, 1] - (img_h / 2.)) / (s * bbox_height)
+        cam_t = torch.stack([tx + cx, ty + cy, tz], dim=-1)
+        return cam_t
+
+    def get_output_mesh(self, params, pred_cam, batch):
+        smpl_output = self.body_model(**{k: v.float() for k, v in params.items()})
+        pred_keypoints_3d = smpl_output.joints
+        pred_vertices = smpl_output.vertices
+        img_h, img_w = batch['img_size'][0]
+        cam_trans = self.convert_to_full_img_cam(
+            pare_cam=pred_cam,
+            bbox_height=batch['box_size'],
+            bbox_center=batch['box_center'],
+            img_w=img_w,
+            img_h=img_h,
+            focal_length=batch['cam_int'][:, 0, 0]
+        )
+        return pred_vertices, pred_keypoints_3d, cam_trans
+
+    def get_cam_intrinsics(self, img):
+        img_h, img_w, c = img.shape
+        aspect_ratio, img_full_resized = resize_image(img, IMAGE_SIZE)
+        img_full_resized = np.transpose(img_full_resized.astype('float32'),
+                            (2, 0, 1))/255.0
+        img_full_resized = self.normalize_img(torch.from_numpy(img_full_resized).float())
+
+        estimated_fov, _ = self.cam_model(img_full_resized.unsqueeze(0))
+        vfov = estimated_fov[0, 1]
+        fl_h = (img_h / (2 * torch.tan(vfov / 2))).item()
+        # fl_h = (img_w * img_w + img_h * img_h) ** 0.5
+        cam_int = np.array([[fl_h, 0, img_w/2], [0, fl_h, img_h / 2], [0, 0, 1]]).astype(np.float32)
+        return cam_int
+
+
+    def remove_pelvis_rotation(self, smpl):
+        """We don't trust the body orientation coming out of bedlam_cliff, so we're just going to zero it out."""
+        smpl.body_pose[0][0][:] = np.zeros(3)
+
+
+
+    def process_image(self, img_path, output_img_folder, i, npz_output):
+        img_cv2 = cv2.imread(str(img_path))
+        img_cv2 = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2RGB)
+        npz_output['imgname'].append(os.path.basename(img_path))
+        
+        fname, img_ext = os.path.splitext(os.path.basename(img_path))
+        overlay_fname = os.path.join(output_img_folder, f'{os.path.basename(fname)}_{i:06d}{img_ext}')
+        smpl_fname = os.path.join(output_img_folder, f'{os.path.basename(fname)}_{i:06d}.smpl')
+        mesh_fname = os.path.join(output_img_folder, f'{os.path.basename(fname)}_{i:06d}.obj')
+        # print(img_path)
+        # Detect humans in the image
+        det_out = self.detector(img_cv2)
+        det_instances = det_out['instances']
+        valid_idx = (det_instances.pred_classes == 0) & (det_instances.scores > 0.5)
+        boxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+        bbox_scale = (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0 
+        bbox_center = (boxes[:, 2:4] + boxes[:, 0:2]) / 2.0
+        npz_output['center'].append(bbox_center[0])
+        npz_output['scale'].append(bbox_scale[0])
+
+        # Get Camera intrinsics using HumanFoV Model
+        cam_int = self.get_cam_intrinsics(img_cv2)
+        npz_output['cam_int'].append(cam_int)
+        dataset = Dataset(img_cv2, bbox_center, bbox_scale, cam_int, False, img_path)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False, num_workers=10)
+
+        for batch in dataloader:
+            batch = recursive_to(batch, self.device)
+            img_h, img_w = batch['img_size'][0]
+            with torch.no_grad():
+                out_smpl_params, out_cam, focal_length_ = self.model(batch)
+                # out_densekp = self.densekp_model(batch)
+                
+            if self.model_type == 'smplx':
+                npz_output['global_orient'].append(batch_rot2aa(out_smpl_params['global_orient'][0]).cpu().numpy())
+                npz_output['body_pose'].append(batch_rot2aa(out_smpl_params['body_pose'][0]).cpu().numpy())
+                npz_output['left_hand_pose'].append(batch_rot2aa(out_smpl_params['left_hand_pose'][0]).cpu().numpy())
+                npz_output['right_hand_pose'].append(batch_rot2aa(out_smpl_params['right_hand_pose'][0]).cpu().numpy())
+                npz_output['shape'].append(out_smpl_params['betas'][0].cpu().numpy())
+            else:
+                global_orient = batch_rot2aa(out_smpl_params['global_orient'][0]).cpu().numpy()
+                body_pose = batch_rot2aa(out_smpl_params['body_pose'][0]).cpu().numpy()
+                npz_output['pose'].append(np.concatenate([global_orient, body_pose], axis=0))
+                npz_output['shape'].append(out_smpl_params['betas'][0].cpu().numpy())
+
+            output_vertices, output_joints, output_cam_trans = self.get_output_mesh(out_smpl_params, out_cam, batch)
+            npz_output['cam_t'].append(output_cam_trans[0].cpu().numpy())
+            
+            # npz_output['dense_kp'].append([])
+            # npz_output['gt_keypoints'].append([])
+
+            mesh = trimesh.Trimesh(output_vertices[0].cpu().numpy() , self.body_model.faces,
+                            process=False)
+            mesh.export(mesh_fname)
+
+            # Render overlay
+            focal_length = (focal_length_[0], focal_length_[0])
+            pred_vertices_array = (output_vertices + output_cam_trans.unsqueeze(1)).detach().cpu().numpy()
+            renderer = Renderer(focal_length=focal_length[0], img_w=img_w, img_h=img_h, faces=self.body_model.faces, same_mesh_color=True)
+            front_view = renderer.render_front_view(pred_vertices_array, bg_img_rgb=img_cv2.copy())
+            final_img = front_view
+            # Write overlay
+            cv2.imwrite(overlay_fname, final_img)
+            renderer.delete()
+
+
+    def run_on_images(self, image_folder, out_folder):
+        if not os.path.exists(out_folder):
+            os.makedirs(out_folder)
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.bmp', '*.tiff', '*.webp']
+        images_list = [image for ext in image_extensions for image in glob(os.path.join(image_folder, ext))]
+        images_list = sorted(images_list)
+        if self.model_type == 'smplx':
+            npz_output = {'imgname': [], 'global_orient': [], 'body_pose': [], 'left_hand_pose': [], 'right_hand_pose': [], 'shape': [], 'cam_t': [], 'cam_int': [], 'center': [], 'scale': [], 'gt_keypoints': [], 'dense_kp': []} 
+        else:
+            npz_output = {'imgname': [], 'pose': [], 'shape': [], 'cam_t': [], 'cam_int': [], 'center': [], 'scale': [], 'gt_keypoints': [], 'dense_kp': []}
+        for ind, img_path in enumerate(images_list):
+            self.process_image(img_path, out_folder, ind, npz_output)
+            img_name = os.path.splitext(os.path.basename(img_path))[0]
+        np.savez(os.path.join(out_folder, 'mesh_estimation_output.npz'), **npz_output)
