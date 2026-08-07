@@ -16,12 +16,14 @@ def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize only the Hand Optimizer
+    # Initialize only the Hand Optimizer (PCA is now handled internally)
     hand_refiner = HandOptimizer()
     inp_data = np.load(init_param_file, allow_pickle=True)
-    # inp_data = dict(inp_data)
 
     processed_data = {key: [] for key in inp_data}
+
+    # Standard MediaPipe to SMPL-X expected order mapping
+    reorder_indices = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1, 2, 3, 4]
 
     for i in range(len(inp_data["imgname"])):
         img_path = os.path.join(image_base_dir, inp_data["imgname"][i])
@@ -31,15 +33,15 @@ def main(args):
             print(f"File not found: {img_path}")
             continue
 
-        # Extract initial data and convert necessary inputs to PyTorch tensors
         global_orient = torch.tensor(np.expand_dims(inp_data["global_orient"][i], axis=0)).to(device).float()
         cam_int_np = inp_data["cam_int"][i]
         cam_t_np = inp_data["cam_t"][i]
         center = torch.tensor(inp_data["center"][i]).to(device).float()
         scale = torch.tensor(inp_data["scale"][i]).to(device).float()
 
-        # Tensors required for hand refinement
         body_pose = torch.tensor(np.expand_dims(inp_data["body_pose"][i], axis=0)).to(device).float()
+        
+        # We still extract these, but they will be seamlessly overridden by the PCA tensor inside refine()
         left_hand_pose = torch.tensor(np.expand_dims(inp_data["left_hand_pose"][i], axis=0)).to(device).float()
         right_hand_pose = torch.tensor(np.expand_dims(inp_data["right_hand_pose"][i], axis=0)).to(device).float()
         betas = torch.tensor(np.expand_dims(inp_data["shape"][i], axis=0)).to(device).float()
@@ -47,10 +49,10 @@ def main(args):
         c_int = torch.tensor(cam_int_np).unsqueeze(0).to(device).float()
         c_t = torch.tensor(cam_t_np).to(device).float()
         
-        mediapipe_kp_left = inp_data["mediapipe_kp_left"][i]
-        mediapipe_kp_right = inp_data["mediapipe_kp_right"][i]
+        # Extract and reorder MediaPipe keypoints
+        mediapipe_kp_left = inp_data["mediapipe_kp_left"][i][reorder_indices]
+        mediapipe_kp_right = inp_data["mediapipe_kp_right"][i][reorder_indices]
 
-        # Populate unoptimized body variables directly from initial data
         processed_data["imgname"].append(img_path)
         processed_data["center"].append(inp_data["center"][i])
         processed_data["scale"].append(inp_data["scale"][i])
@@ -60,7 +62,8 @@ def main(args):
         processed_data["global_orient"].append(global_orient[0])
         processed_data["body_pose"].append(body_pose[0])
 
-        left_hand_pose, right_hand_pose, left_wrist, right_wrist = hand_refiner.refine(
+        # refine() computes in PCA space but returns the standard 45-DoF shape (1, 15, 3)
+        left_hand_pose_out, right_hand_pose_out, left_wrist, right_wrist = hand_refiner.refine(
             global_orient=global_orient,
             body_pose=body_pose,
             left_hand_pose=left_hand_pose,
@@ -70,16 +73,15 @@ def main(args):
             cam_int=c_int,
             bbox_center=center,
             bbox_scale=scale,
-            target_mp=torch.tensor(np.stack([mediapipe_kp_right, mediapipe_kp_left])).to(device).float(),
+            target_mp=torch.tensor(np.stack([mediapipe_kp_left, mediapipe_kp_right])).to(device).float(),
             img_path=img_path
         )
         
-        processed_data["left_hand_pose"].append(left_hand_pose[0].detach().cpu().numpy())
-        processed_data["right_hand_pose"].append(right_hand_pose[0].detach().cpu().numpy())
+        processed_data["left_hand_pose"].append(left_hand_pose_out[0].detach().cpu().numpy())
+        processed_data["right_hand_pose"].append(right_hand_pose_out[0].detach().cpu().numpy())
         processed_data["body_pose"][-1][19] = left_wrist
         processed_data["body_pose"][-1][20] = right_wrist
     
-    # Save results# Convert any remaining tensors in the lists to numpy arrays
     for key in processed_data:
         processed_data[key] = [
             item.detach().cpu().numpy() if isinstance(item, torch.Tensor) else item 
@@ -91,28 +93,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Hand Optimization on a dataset")
-    parser.add_argument(
-        "--input",
-        type=str,
-        default="data/demo_files_for_optimization/init_params/filtered_aic.npz",
-        help="Path to the initial parameter file (.npz)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="out_params",
-        help="Directory to save output data",
-    )
-    parser.add_argument(
-        "--image_dir",
-        type=str,
-        default="data/demo_files_for_optimization/demo_images",
-        help="Path to the image dataset directory",
-    )
-    # Note: Kept the arguments from your original parser to prevent breaking your terminal commands,
-    # though vis/vis_int/loss bounds aren't used for the hand refiner in the provided snippet.
-    parser.add_argument("--vis", type=bool, required=False, help="Visualization of fitting")
-    parser.add_argument("--verbose", type=bool, required=False, help="Print losses")
+    parser.add_argument("--input", type=str, default="data/demo_files_for_optimization/init_params/filtered_aic.npz")
+    parser.add_argument("--output_dir", type=str, default="out_params")
+    parser.add_argument("--image_dir", type=str, default="data/demo_files_for_optimization/demo_images")
+    parser.add_argument("--vis", type=bool, required=False)
+    parser.add_argument("--verbose", type=bool, required=False)
     parser.add_argument("--vis_int", type=int, default=100, required=False)
     parser.add_argument("--loss_cut", type=int, default=100, required=False)
     parser.add_argument("--high_threshold", type=int, default=50, required=False)
